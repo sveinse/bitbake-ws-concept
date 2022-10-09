@@ -21,6 +21,8 @@ import fcntl
 import struct
 import copy
 import atexit
+import websocket
+import json
 from itertools import groupby
 
 from bb.ui import uihelper
@@ -226,11 +228,11 @@ class TerminalFilter(object):
         else:
             return "%ds" % (sec)
 
-    def keepAlive(self, t):
+    def keepAlive(self, t, ws):
         if not self.cuu:
-            print("Bitbake still alive (no events for %ds). Active tasks:" % t)
+            ws.print("Bitbake still alive (no events for %ds). Active tasks:" % t)
             for t in self.helper.running_tasks:
-                print(t)
+                ws.print(t)
             sys.stdout.flush()
 
     def updateFooter(self):
@@ -408,6 +410,67 @@ def drain_events_errorhandling(eventHandler):
         if isinstance(event, logging.LogRecord):
             logger.handle(event)
 
+
+class WSHandler(logging.Handler):
+    def __init__(self, get_ws):
+        super().__init__()
+        self.ws = get_ws()
+
+    def emit(self, record):
+        self.ws.log(self.format(record))
+
+
+class JSONEventEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (bb.event.Event, bb.runqueue.RunQueueStats)):
+            return obj.__dict__
+        return json.JSONEncoder.default(self, obj)
+
+
+class WSTap():
+    def __init__(self, ws):
+        self.ws = ws
+        self.shutdown = 0
+        atexit.register(ws.close)
+
+    @classmethod
+    def connect(cls, url, **kwargs):
+        ws = websocket.create_connection(url, **kwargs)
+        return cls(ws)
+
+    def send(self, obj):
+        self.ws.send(json.dumps(obj, cls=JSONEventEncoder))
+
+    def log(self, msg):
+        self.send({
+            "event": "Log",
+            "msg": msg
+        })
+
+    def eventHandler(self, event):
+        if isinstance(event, (logging.LogRecord, bb.runqueue.runQueueExitWait)):
+            return
+        self.send({
+            "event": type(event).__name__,
+            "data": event,
+        })
+
+    def print(self, msg):
+        print(msg)
+        self.send({
+            "event": "Print",
+            "msg": msg,
+        })
+
+    def checkShutdown(self, shutdown):
+        if self.shutdown != shutdown:
+            self.shutdown = shutdown
+            self.send({
+                "event": "Shutdown",
+                "value": shutdown,
+            })
+
+
 def main(server, eventHandler, params, tf = TerminalFilter):
 
     try:
@@ -558,6 +621,28 @@ def main(server, eventHandler, params, tf = TerminalFilter):
         except OSError:
            pass
 
+    ws = WSTap.connect("ws://localhost:9000")
+    ws.send({'command': 'reset'})
+    def get_ws():
+        return ws
+
+    logconfig = bb.msg.mergeLoggingConfig(logconfig, {
+        "version": 1,
+        "handlers": {
+            "WS": {
+                "class": "bb.ui.knotty.WSHandler",
+                "formatter": "BitBake.logfileFormatter",
+                "level": loglevel,
+                "get_ws": get_ws,
+            },
+        },
+        "loggers": {
+            "BitBake": {
+                "handlers": ["WS"],
+            }
+        }
+    })
+
     # Add the logging domains specified by the user on the command line
     for (domainarg, iterator) in groupby(params.debug_domains):
         dlevel = len(tuple(iterator))
@@ -633,9 +718,10 @@ def main(server, eventHandler, params, tf = TerminalFilter):
     while True:
         try:
             if (lastprint + printinterval) <= time.time():
-                termfilter.keepAlive(printinterval)
+                termfilter.keepAlive(printinterval, ws)
                 printinterval += printintervaldelta
             event = eventHandler.waitEvent(0)
+            ws.checkShutdown(main.shutdown)
             if event is None:
                 if main.shutdown > 1:
                     break
@@ -645,6 +731,7 @@ def main(server, eventHandler, params, tf = TerminalFilter):
                 if event is None:
                     continue
             helper.eventHandler(event)
+            ws.eventHandler(event)
             if isinstance(event, bb.runqueue.runQueueExitWait):
                 if not main.shutdown:
                     main.shutdown = 1
@@ -721,7 +808,7 @@ def main(server, eventHandler, params, tf = TerminalFilter):
                 parseprogress.finish()
                 parseprogress = None
                 if params.options.quiet == 0:
-                    print(("Parsing of %d .bb files complete (%d cached, %d parsed). %d targets, %d skipped, %d masked, %d errors."
+                    ws.print(("Parsing of %d .bb files complete (%d cached, %d parsed). %d targets, %d skipped, %d masked, %d errors."
                         % ( event.total, event.cached, event.parsed, event.virtuals, event.skipped, event.masked, event.errors)))
                 continue
 
@@ -740,7 +827,7 @@ def main(server, eventHandler, params, tf = TerminalFilter):
                     continue
                 cacheprogress.finish()
                 if params.options.quiet == 0:
-                    print("Loaded %d entries from dependency cache." % event.num_entries)
+                    ws.print("Loaded %d entries from dependency cache." % event.num_entries)
                 continue
 
             if isinstance(event, bb.command.CommandFailed):
@@ -853,11 +940,11 @@ def main(server, eventHandler, params, tf = TerminalFilter):
         except KeyboardInterrupt:
             termfilter.clearFooter()
             if params.observe_only:
-                print("\nKeyboard Interrupt, exiting observer...")
+                ws.print("\nKeyboard Interrupt, exiting observer...")
                 main.shutdown = 2
 
             def state_force_shutdown():
-                print("\nSecond Keyboard Interrupt, stopping...\n")
+                ws.print("\nSecond Keyboard Interrupt, stopping...\n")
                 _, error = server.runCommand(["stateForceShutdown"])
                 if error:
                     logger.error("Unable to cleanly stop: %s" % error)
@@ -866,7 +953,7 @@ def main(server, eventHandler, params, tf = TerminalFilter):
                 state_force_shutdown()
 
             if not params.observe_only and main.shutdown == 0:
-                print("\nKeyboard Interrupt, closing down...\n")
+                ws.print("\nKeyboard Interrupt, closing down...\n")
                 interrupted = True
                 # Capture the second KeyboardInterrupt during stateShutdown is running
                 try:
@@ -899,12 +986,14 @@ def main(server, eventHandler, params, tf = TerminalFilter):
             summary += pluralise("\nSummary: There was %s ERROR message, returning a non-zero exit code.",
                                  "\nSummary: There were %s ERROR messages, returning a non-zero exit code.", errors)
         if summary and params.options.quiet == 0:
-            print(summary)
+            ws.print(summary)
 
         if interrupted:
-            print("Execution was interrupted, returning a non-zero exit code.")
+            ws.print("Execution was interrupted, returning a non-zero exit code.")
             if return_value == 0:
                 return_value = 1
+
+        ws.send({'event': 'Quit'})
     except IOError as e:
         import errno
         if e.errno == errno.EPIPE:
