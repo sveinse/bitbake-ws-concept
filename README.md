@@ -16,7 +16,7 @@ connected web clients.
 
 Key components:
  * Knotty UI: [lib/bb/ui/knotty.py](lib/bb/ui/knotty.py)
- * WebKnotty UI (webapp): [contrib/webknotty/](contrib/webknotty/)
+ * WebKnotty UI (webapp): [contrib/webknotty/src/webknotty.js](contrib/webknotty/src/webknotty.js)
  * WS proxy server: [contrib/wsproxy.py](contrib/wsproxy.py)
 
 > **NOTE:** This is a concept test for demonstrating feasibility of a feature.
